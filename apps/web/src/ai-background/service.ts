@@ -1,6 +1,12 @@
 const DEFAULT_SERVICE_URL = "http://127.0.0.1:8788";
 
 export type BackgroundMode = "transparent" | "color" | "image";
+export type SelectionPoint = {
+	x: number;
+	y: number;
+	label: 0 | 1;
+	subjectId: number;
+};
 
 export type ServiceHealth = {
 	status: "ok";
@@ -47,23 +53,28 @@ export async function checkSamService(): Promise<ServiceHealth> {
 
 export async function removeBackground({
 	file,
-	point,
+	points,
 	mode,
 	backgroundColor,
 	backgroundImage,
+	edgeExpand,
+	edgeFeather,
 }: {
 	file: File;
-	point: { x: number; y: number };
+	points: SelectionPoint[];
 	mode: BackgroundMode;
 	backgroundColor: string;
 	backgroundImage?: File;
+	edgeExpand: number;
+	edgeFeather: number;
 }): Promise<File> {
 	const body = new FormData();
 	body.append("media", file, file.name);
-	body.append("point_x", point.x.toString());
-	body.append("point_y", point.y.toString());
+	body.append("points_json", JSON.stringify(points));
 	body.append("background_mode", mode);
 	body.append("background_color", backgroundColor);
+	body.append("edge_expand", edgeExpand.toString());
+	body.append("edge_feather", edgeFeather.toString());
 	if (backgroundImage) {
 		body.append("background_image", backgroundImage, backgroundImage.name);
 	}
@@ -98,4 +109,37 @@ export async function removeBackground({
 	return new File([blob], name, {
 		type: blob.type || (fallbackExtension === "png" ? "image/png" : "video/webm"),
 	});
+}
+
+export async function previewMask({
+	file,
+	points,
+	edgeExpand,
+	edgeFeather,
+}: {
+	file: File;
+	points: SelectionPoint[];
+	edgeExpand: number;
+	edgeFeather: number;
+}): Promise<Blob> {
+	const body = new FormData();
+	body.append("media", file, file.name);
+	body.append("points_json", JSON.stringify(points));
+	body.append("edge_expand", edgeExpand.toString());
+	body.append("edge_feather", edgeFeather.toString());
+	const response = await fetch(`${getServiceUrl()}/v1/preview-mask`, {
+		method: "POST",
+		body,
+	});
+	if (!response.ok) {
+		let message = "Không thể tạo xem trước";
+		try {
+			const payload: unknown = await response.json();
+			if (isRecord(payload) && typeof payload.detail === "string") message = payload.detail;
+		} catch {
+			// Keep the friendly fallback when the service does not return JSON.
+		}
+		throw new Error(message);
+	}
+	return response.blob();
 }
