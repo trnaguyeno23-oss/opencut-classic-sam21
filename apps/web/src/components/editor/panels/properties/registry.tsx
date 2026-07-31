@@ -28,6 +28,7 @@ import { MasksTab } from "@/masks/components/masks-tab";
 import { SpeedTab } from "@/speed/components/speed-tab";
 import { GraphicTab } from "@/graphics/components/graphic-tab";
 import { OcShapesIcon } from "@/components/icons";
+import { AiBackgroundTab } from "@/ai-background/components/ai-background-tab";
 
 const TRANSFORM_PARAM_KEYS = [
 	"transform.positionX",
@@ -176,6 +177,21 @@ function buildClipEffectsTab({
 	};
 }
 
+function buildAiBackgroundTab({
+	element,
+}: {
+	element: VideoElement | ImageElement;
+}): PropertiesTabDef {
+	return {
+		id: "ai-background",
+		label: "Xóa nền AI",
+		icon: <HugeiconsIcon icon={MagicWand05Icon} size={16} />,
+		content: ({ trackId }) => (
+			<AiBackgroundTab element={element} trackId={trackId} />
+		),
+	};
+}
+
 function buildTextTab({ element }: { element: TextElement }): PropertiesTabDef {
 	return {
 		id: "text",
@@ -247,6 +263,7 @@ function getVideoConfig({
 		defaultTab: "transform",
 		tabs: [
 			buildTransformTab({ element }),
+			buildAiBackgroundTab({ element }),
 			...(showAudioTab ? [buildAudioTab({ element })] : []),
 			buildSpeedTab({ element }),
 			buildBlendingTab({ element }),
@@ -265,6 +282,7 @@ function getImageConfig({
 		defaultTab: "transform",
 		tabs: [
 			buildTransformTab({ element }),
+			buildAiBackgroundTab({ element }),
 			buildBlendingTab({ element }),
 			buildMasksTab({ element }),
 			buildClipEffectsTab({ element }),
