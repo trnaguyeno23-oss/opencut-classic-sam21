@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -106,7 +107,9 @@ def _composite(
     background: Image.Image | None,
 ) -> Image.Image:
     foreground = Image.fromarray(rgb.astype(np.uint8), mode="RGB")
-    alpha = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+    alpha = Image.fromarray(
+        np.clip(mask.astype(np.float32) * 255, 0, 255).astype(np.uint8), mode="L"
+    )
     if mode == "transparent":
         foreground.putalpha(alpha)
         return foreground
@@ -121,26 +124,99 @@ def _composite(
     return base
 
 
+def _parse_points(
+    points_json: str | None,
+    point_x: float | None,
+    point_y: float | None,
+) -> list[dict[str, float | int]]:
+    if points_json:
+        try:
+            raw_points = json.loads(points_json)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=400, detail="Danh sách điểm chọn không hợp lệ.") from error
+    elif point_x is not None and point_y is not None:
+        raw_points = [{"x": point_x, "y": point_y, "label": 1, "subjectId": 1}]
+    else:
+        raw_points = []
+
+    points: list[dict[str, float | int]] = []
+    for raw in raw_points:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            x = float(raw["x"])
+            y = float(raw["y"])
+            label = 1 if int(raw.get("label", 1)) else 0
+            subject_id = max(1, int(raw.get("subjectId", 1)))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            points.append({"x": x, "y": y, "label": label, "subjectId": subject_id})
+
+    if not points or not any(point["label"] == 1 for point in points):
+        raise HTTPException(status_code=400, detail="Hãy thêm ít nhất một điểm giữ chủ thể.")
+    return points
+
+
+def _group_points(
+    points: list[dict[str, float | int]], width: int, height: int
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    grouped: dict[int, list[dict[str, float | int]]] = {}
+    for point in points:
+        grouped.setdefault(int(point["subjectId"]), []).append(point)
+    result: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for subject_id, subject_points in grouped.items():
+        if not any(point["label"] == 1 for point in subject_points):
+            continue
+        coords = np.asarray(
+            [[float(point["x"]) * width, float(point["y"]) * height] for point in subject_points],
+            dtype=np.float32,
+        )
+        labels = np.asarray([int(point["label"]) for point in subject_points], dtype=np.int32)
+        result[subject_id] = (coords, labels)
+    return result
+
+
+def _refine_mask(mask: np.ndarray, edge_expand: int, edge_feather: int) -> np.ndarray:
+    refined = mask.astype(np.uint8) * 255
+    if edge_expand:
+        kernel_size = abs(edge_expand) * 2 + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        refined = (
+            cv2.dilate(refined, kernel, iterations=1)
+            if edge_expand > 0
+            else cv2.erode(refined, kernel, iterations=1)
+        )
+    if edge_feather:
+        blur_size = edge_feather * 2 + 1
+        refined = cv2.GaussianBlur(refined, (blur_size, blur_size), 0)
+    return refined.astype(np.float32) / 255.0
+
+
 def _segment_image(
     input_path: Path,
     output_path: Path,
-    point_x: float,
-    point_y: float,
+    points: list[dict[str, float | int]],
     mode: str,
     color: tuple[int, int, int],
     background: Image.Image | None,
+    edge_expand: int,
+    edge_feather: int,
 ) -> None:
     image = np.asarray(Image.open(input_path).convert("RGB"))
     height, width = image.shape[:2]
     predictor = _image_predictor()
     with MODEL_LOCK, torch.inference_mode():
         predictor.set_image(image)
-        masks, scores, _ = predictor.predict(
-            point_coords=np.asarray([[point_x * width, point_y * height]], dtype=np.float32),
-            point_labels=np.asarray([1], dtype=np.int32),
-            multimask_output=True,
-        )
-    mask = masks[int(np.argmax(scores))]
+        combined = np.zeros((height, width), dtype=bool)
+        for coords, labels in _group_points(points, width, height).values():
+            masks, scores, _ = predictor.predict(
+                point_coords=coords,
+                point_labels=labels,
+                multimask_output=True,
+            )
+            combined |= masks[int(np.argmax(scores))]
+    mask = _refine_mask(combined, edge_expand, edge_feather)
     result = _composite(image, mask, mode, color, background)
     result.save(output_path, "PNG", optimize=True)
 
@@ -239,12 +315,13 @@ def _encode_frames(
 def _segment_video(
     input_path: Path,
     output_path: Path,
-    point_x: float,
-    point_y: float,
+    points: list[dict[str, float | int]],
     mode: str,
     color: tuple[int, int, int],
     background: Image.Image | None,
     work_dir: Path,
+    edge_expand: int,
+    edge_feather: int,
 ) -> None:
     source_frames = work_dir / "source-frames"
     output_frames = work_dir / "output-frames"
@@ -262,18 +339,20 @@ def _segment_video(
 
     with MODEL_LOCK, torch.inference_mode():
         state = predictor.init_state(video_path=str(source_frames))
-        predictor.add_new_points_or_box(
-            inference_state=state,
-            frame_idx=0,
-            obj_id=1,
-            points=np.asarray([[point_x * width, point_y * height]], dtype=np.float32),
-            labels=np.asarray([1], dtype=np.int32),
-        )
-        for frame_index, object_ids, mask_logits in predictor.propagate_in_video(state):
-            object_index = list(object_ids).index(1)
-            masks_by_frame[int(frame_index)] = (
-                mask_logits[object_index].detach().cpu().numpy().squeeze() > 0
+        grouped = _group_points(points, width, height)
+        for subject_id, (coords, labels) in grouped.items():
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=0,
+                obj_id=subject_id,
+                points=coords,
+                labels=labels,
             )
+        for frame_index, object_ids, mask_logits in predictor.propagate_in_video(state):
+            combined = np.zeros((height, width), dtype=bool)
+            for object_index, _object_id in enumerate(object_ids):
+                combined |= mask_logits[object_index].detach().cpu().numpy().squeeze() > 0
+            masks_by_frame[int(frame_index)] = combined
         predictor.reset_state(state)
 
     for index, frame_path in enumerate(frame_paths):
@@ -281,7 +360,8 @@ def _segment_video(
         mask = masks_by_frame.get(index)
         if mask is None:
             mask = np.zeros(rgb.shape[:2], dtype=bool)
-        result = _composite(rgb, mask, mode, color, background)
+        refined = _refine_mask(mask, edge_expand, edge_feather)
+        result = _composite(rgb, refined, mode, color, background)
         result.save(output_frames / f"{index + 1:06d}.png", "PNG")
 
     _encode_frames(output_frames, input_path, output_path, fps, mode == "transparent")
@@ -300,14 +380,74 @@ def health() -> dict[str, object]:
     }
 
 
+@app.post("/v1/preview-mask")
+def preview_mask(
+    media: UploadFile = File(...),
+    points_json: str = Form(...),
+    edge_expand: int = Form(0, ge=-12, le=12),
+    edge_feather: int = Form(2, ge=0, le=20),
+):
+    _require_runtime()
+    points = _parse_points(points_json, None, None)
+    work_dir = Path(tempfile.mkdtemp(prefix="opencut-sam21-preview-"))
+    input_suffix = Path(media.filename or "media.bin").suffix or ".bin"
+    input_path = work_dir / f"input{input_suffix}"
+    preview_input = work_dir / "preview-input.png"
+    output_path = work_dir / "mask-preview.png"
+    _write_upload(media, input_path)
+
+    try:
+        is_image = (media.content_type or "").startswith("image/")
+        if is_image:
+            image = np.asarray(Image.open(input_path).convert("RGB"))
+        else:
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_path),
+                "-frames:v", "1", "-y", str(preview_input),
+            ]
+            subprocess.run(command, check=True)
+            image = np.asarray(Image.open(preview_input).convert("RGB"))
+
+        height, width = image.shape[:2]
+        predictor = _image_predictor()
+        with MODEL_LOCK, torch.inference_mode():
+            predictor.set_image(image)
+            combined = np.zeros((height, width), dtype=bool)
+            for coords, labels in _group_points(points, width, height).values():
+                masks, scores, _ = predictor.predict(
+                    point_coords=coords,
+                    point_labels=labels,
+                    multimask_output=True,
+                )
+                combined |= masks[int(np.argmax(scores))]
+        mask = _refine_mask(combined, edge_expand, edge_feather)[..., None]
+        cyan = np.zeros_like(image, dtype=np.float32)
+        cyan[:, :] = (20, 210, 235)
+        preview = image.astype(np.float32) * (1 - mask * 0.48) + cyan * mask * 0.48
+        Image.fromarray(np.clip(preview, 0, 255).astype(np.uint8)).save(output_path, "PNG")
+    except Exception as error:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Không tạo được xem trước: {error}") from error
+
+    return FileResponse(
+        output_path,
+        media_type="image/png",
+        filename="mask-preview.png",
+        background=BackgroundTask(shutil.rmtree, work_dir, ignore_errors=True),
+    )
+
+
 @app.post("/v1/remove-background")
 def remove_background(
     media: UploadFile = File(...),
-    point_x: float = Form(..., ge=0.0, le=1.0),
-    point_y: float = Form(..., ge=0.0, le=1.0),
+    point_x: float | None = Form(None, ge=0.0, le=1.0),
+    point_y: float | None = Form(None, ge=0.0, le=1.0),
+    points_json: str | None = Form(None),
     background_mode: str = Form("transparent"),
     background_color: str = Form("#00ff00"),
     background_image: UploadFile | None = File(None),
+    edge_expand: int = Form(0, ge=-12, le=12),
+    edge_feather: int = Form(2, ge=0, le=20),
 ):
     _require_runtime()
     if background_mode not in {"transparent", "color", "image"}:
@@ -316,6 +456,7 @@ def remove_background(
         raise HTTPException(status_code=400, detail="Chưa chọn ảnh nền mới.")
 
     color = _hex_to_rgb(background_color)
+    points = _parse_points(points_json, point_x, point_y)
     work_dir = Path(tempfile.mkdtemp(prefix="opencut-sam21-"))
     input_suffix = Path(media.filename or "media.bin").suffix or ".bin"
     input_path = work_dir / f"input{input_suffix}"
@@ -338,23 +479,25 @@ def remove_background(
             _segment_image(
                 input_path,
                 output_path,
-                point_x,
-                point_y,
+                points,
                 background_mode,
                 color,
                 background,
+                edge_expand,
+                edge_feather,
             )
             media_type = "image/png"
         else:
             _segment_video(
                 input_path,
                 output_path,
-                point_x,
-                point_y,
+                points,
                 background_mode,
                 color,
                 background,
                 work_dir,
+                edge_expand,
+                edge_feather,
             )
             media_type = "video/webm" if output_suffix == ".webm" else "video/mp4"
     except HTTPException:
