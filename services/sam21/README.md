@@ -4,6 +4,14 @@ Dịch vụ local dùng `sam2.1_hiera_tiny` để tách người/vật khỏi �
 
 ## Cài trên Windows
 
+### Cách dễ nhất
+
+Tại thư mục gốc của OpenCut, nhấp đúp `CAI-DAT-OPENCUT.bat`. Bộ cài sẽ tự kiểm tra và cài Python 3.11, FFmpeg, Bun, thư viện OpenCut, SAM 2.1 Tiny, sau đó tạo biểu tượng **OpenCut SAM 2.1** ngoài Desktop.
+
+Những lần sau chỉ cần mở biểu tượng Desktop hoặc nhấp đúp `MO-OPENCUT.bat`.
+
+### Cài thủ công
+
 Yêu cầu:
 
 - Python 3.11 x64
