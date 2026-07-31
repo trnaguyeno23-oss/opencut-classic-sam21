@@ -4,7 +4,15 @@ $ServiceRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvPath = Join-Path $ServiceRoot ".venv"
 $ModelPath = Join-Path $ServiceRoot "models\sam2.1_hiera_tiny.pt"
 
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+$BootstrapPython = $env:SAM21_PYTHON
+if (-not $BootstrapPython) {
+    $PythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($PythonCommand) {
+        $BootstrapPython = $PythonCommand.Source
+    }
+}
+
+if (-not $BootstrapPython -or -not (Test-Path $BootstrapPython)) {
     throw "Chua tim thay Python. Hay cai Python 3.11 roi chay lai."
 }
 
@@ -13,7 +21,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 }
 
 if (-not (Test-Path $VenvPath)) {
-    python -m venv $VenvPath
+    & $BootstrapPython -m venv $VenvPath
 }
 
 $Python = Join-Path $VenvPath "Scripts\python.exe"
