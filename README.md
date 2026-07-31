@@ -31,6 +31,10 @@ Thanks to [Vercel](https://vercel.com?utm_source=github-opencut&utm_campaign=oss
 
 ## Getting Started
 
+### Windows one-click setup (SAM 2.1)
+
+Download or clone this repository, then double-click `CAI-DAT-OPENCUT.bat`. It installs the required Windows tools through WinGet, prepares OpenCut and the local CPU-only SAM 2.1 service, and creates an **OpenCut SAM 2.1** Desktop shortcut. Use `MO-OPENCUT.bat` to start both services again later.
+
 ### Prerequisites
 
 - [Bun](https://bun.sh/docs/installation)
@@ -159,4 +163,3 @@ See our [Contributing Guide](.github/CONTRIBUTING.md) for detailed setup instruc
 ---
 
 ![Star History Chart](https://api.star-history.com/svg?repos=opencut-app/opencut&type=Date)
-
