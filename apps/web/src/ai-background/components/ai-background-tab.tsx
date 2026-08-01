@@ -12,6 +12,7 @@ import {
 	checkSamService,
 	previewMask,
 	removeBackground,
+	type AutoDetectMode,
 	type BackgroundMode,
 	type SelectionPoint,
 } from "../service";
@@ -25,6 +26,13 @@ const MODES: Array<{ id: BackgroundMode; label: string }> = [
 	{ id: "transparent", label: "Trong suốt" },
 	{ id: "color", label: "Màu đơn" },
 	{ id: "image", label: "Ảnh nền" },
+];
+const AUTO_MODES: Array<{ id: AutoDetectMode; label: string }> = [
+	{ id: "main", label: "Chủ thể chính" },
+	{ id: "person", label: "Người" },
+	{ id: "animals", label: "Động vật" },
+	{ id: "person_animals", label: "Người và động vật" },
+	{ id: "text", label: "Mô tả bằng chữ" },
 ];
 
 function makeSubject(id: number): Subject {
@@ -48,6 +56,9 @@ export function AiBackgroundTab({
 		e.media.getAssets().find((asset) => asset.id === element.mediaId),
 	);
 	const [subjects, setSubjects] = useState<Subject[]>([makeSubject(1)]);
+	const [autoDetect, setAutoDetect] = useState(true);
+	const [autoMode, setAutoMode] = useState<AutoDetectMode>("main");
+	const [autoPrompt, setAutoPrompt] = useState("");
 	const [activeSubjectId, setActiveSubjectId] = useState(1);
 	const [pointMode, setPointMode] = useState<PointMode>("keep");
 	const [mode, setMode] = useState<BackgroundMode>("transparent");
@@ -90,6 +101,7 @@ export function AiBackgroundTab({
 	};
 
 	const handlePickPoint = (event: React.MouseEvent<HTMLDivElement>) => {
+		if (autoDetect) return;
 		const bounds = previewRef.current?.getBoundingClientRect();
 		if (!bounds) return;
 		const rawX = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
@@ -180,7 +192,7 @@ export function AiBackgroundTab({
 	};
 
 	const handleProcess = async () => {
-		if (!mediaAsset || !activeProject || !hasKeepPoint) return;
+		if (!mediaAsset || !activeProject || (!autoDetect && !hasKeepPoint)) return;
 		if (mode === "image" && !backgroundImage) {
 			toast.error("Hãy chọn ảnh nền trước");
 			return;
@@ -195,6 +207,9 @@ export function AiBackgroundTab({
 				backgroundImage,
 				edgeExpand,
 				edgeFeather,
+				autoDetect,
+				autoMode,
+				autoPrompt,
 			});
 			const [processed] = await processMediaAssets({ files: [output] });
 			if (!processed) throw new Error("Không đọc được kết quả từ SAM 2.1");
@@ -218,13 +233,29 @@ export function AiBackgroundTab({
 				<div>
 					<h3 className="text-sm font-semibold">Tách chủ thể bằng SAM 2.1</h3>
 					<p className="mt-1 text-xs text-zinc-400">
-						Chọn chủ thể, rồi chấm điểm giữ hoặc điểm loại trực tiếp trên ảnh.
+						AI có thể tự tìm lại chủ thể ở từng cảnh hoặc anh có thể chọn điểm thủ công.
 					</p>
 				</div>
 
-				<Button variant="outline" size="sm" onClick={addSubject} className="w-full border-zinc-700 bg-zinc-900 text-zinc-100">
-					+ Thêm chủ thể
-				</Button>
+				<div className="grid grid-cols-2 gap-2 rounded-md bg-zinc-900 p-1">
+					<Button size="sm" onClick={() => { setAutoDetect(true); clearMaskPreview(); }} className={cn(autoDetect ? "bg-cyan-700" : "bg-transparent", "text-white")}>Tự động</Button>
+					<Button size="sm" onClick={() => setAutoDetect(false)} className={cn(!autoDetect ? "bg-violet-700" : "bg-transparent", "text-white")}>Chọn điểm</Button>
+				</div>
+
+				{autoDetect ? (
+					<div className="space-y-2 rounded-md border border-cyan-900/70 bg-cyan-950/30 p-3">
+						<label htmlFor="sam-auto-mode" className="block text-xs font-medium">AI cần giữ lại</label>
+						<select id="sam-auto-mode" value={autoMode} onChange={(event) => setAutoMode(event.target.value as AutoDetectMode)} className="h-9 w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 text-xs text-zinc-100">
+							{AUTO_MODES.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+						</select>
+						{autoMode === "text" && (
+							<input value={autoPrompt} onChange={(event) => setAutoPrompt(event.target.value)} placeholder="Ví dụ: người, chó, ngựa..." className="h-9 w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 text-xs text-zinc-100" />
+						)}
+						<p className="text-[11px] leading-relaxed text-cyan-200/70">AI dò cảnh mới và nhận diện lại chủ thể, giúp tránh bám nhầm toàn bộ khung hình.</p>
+					</div>
+				) : (
+					<>
+						<Button variant="outline" size="sm" onClick={addSubject} className="w-full border-zinc-700 bg-zinc-900 text-zinc-100">+ Thêm chủ thể</Button>
 
 				<div className="flex flex-wrap gap-1.5">
 					{subjects.map((subject) => (
@@ -254,6 +285,8 @@ export function AiBackgroundTab({
 						− Loại nền
 					</Button>
 				</div>
+					</>
+				)}
 
 				<div
 					ref={previewRef}
@@ -261,6 +294,7 @@ export function AiBackgroundTab({
 					tabIndex={0}
 					onClick={handlePickPoint}
 					onKeyDown={(event) => {
+						if (autoDetect) return;
 						if (event.key === "Enter" || event.key === " ") {
 							event.preventDefault();
 							const centerPoint: MarkerPoint = {
@@ -279,7 +313,7 @@ export function AiBackgroundTab({
 							clearMaskPreview();
 						}
 					}}
-					className="relative aspect-video w-full cursor-crosshair overflow-hidden rounded-md border border-zinc-700 bg-zinc-900"
+					className={cn("relative aspect-video w-full overflow-hidden rounded-md border border-zinc-700 bg-zinc-900", !autoDetect && "cursor-crosshair")}
 				>
 					{maskPreviewUrl || sourcePreviewUrl ? (
 						// eslint-disable-next-line @next/next/no-img-element
@@ -287,7 +321,7 @@ export function AiBackgroundTab({
 					) : (
 						<div className="flex size-full items-center justify-center text-xs text-zinc-500">Không có ảnh xem trước</div>
 					)}
-					{subjects.flatMap((subject) =>
+					{!autoDetect && subjects.flatMap((subject) =>
 						subject.points.map((point, index) => (
 							<span
 								key={`${subject.id}-${index}`}
@@ -307,10 +341,10 @@ export function AiBackgroundTab({
 					)}
 				</div>
 
-				<div className="flex items-center justify-between text-[11px] text-zinc-400">
+				{!autoDetect && <div className="flex items-center justify-between text-[11px] text-zinc-400">
 					<span>Tím/màu: giữ · Đỏ: loại</span>
 					<button type="button" onClick={undoPoint} className="text-cyan-400">Hoàn tác điểm</button>
-				</div>
+				</div>}
 
 				<div className="space-y-3 rounded-md border border-zinc-800 bg-zinc-900/70 p-3">
 					<label htmlFor="sam-edge-expand" className="block text-xs">
@@ -323,9 +357,9 @@ export function AiBackgroundTab({
 					</label>
 				</div>
 
-				<Button variant="outline" size="sm" onClick={handlePreview} disabled={!hasKeepPoint || isPreviewing || serviceState !== "online"} className="w-full border-zinc-700 bg-zinc-900 text-zinc-100">
+				{!autoDetect && <Button variant="outline" size="sm" onClick={handlePreview} disabled={!hasKeepPoint || isPreviewing || serviceState !== "online"} className="w-full border-zinc-700 bg-zinc-900 text-zinc-100">
 					{isPreviewing ? "Đang tạo xem trước..." : "Xem trước vùng tách"}
-				</Button>
+				</Button>}
 
 				<div className="space-y-2">
 					<p className="text-xs font-medium">Nền đầu ra</p>
@@ -353,10 +387,10 @@ export function AiBackgroundTab({
 					<span>{serviceState === "online" ? "SAM 2.1 Tiny đã sẵn sàng" : serviceState === "offline" ? "Chưa mở dịch vụ SAM 2.1 local" : "Đang kiểm tra dịch vụ..."}</span>
 				</div>
 
-				<Button className="w-full bg-gradient-to-r from-violet-600 to-cyan-600 text-white" disabled={!hasKeepPoint || serviceState !== "online" || isProcessing} onClick={handleProcess}>
-					{isProcessing ? "Đang tách chủ thể..." : "Tách chủ thể và thay nền"}
+				<Button className="w-full bg-gradient-to-r from-violet-600 to-cyan-600 text-white" disabled={(!autoDetect && !hasKeepPoint) || serviceState !== "online" || isProcessing} onClick={handleProcess}>
+					{isProcessing ? "Đang tự động tách..." : autoDetect ? "Tự động tách theo từng cảnh" : "Tách chủ thể và thay nền"}
 				</Button>
-				<p className="text-[11px] leading-relaxed text-zinc-500">CPU xử lý video chậm; nên thử xem trước và dùng clip 5–15 giây.</p>
+				<p className="text-[11px] leading-relaxed text-zinc-500">Lần chạy tự động đầu tiên sẽ tải bộ nhận diện AI (~170 MB). CPU xử lý video chậm; nên dùng clip 5–15 giây.</p>
 			</SectionContent>
 		</Section>
 	);
