@@ -1,6 +1,7 @@
 const DEFAULT_SERVICE_URL = "http://127.0.0.1:8788";
 
 export type BackgroundMode = "transparent" | "color" | "image";
+export type AutoDetectMode = "main" | "person" | "animals" | "person_animals" | "text";
 export type SelectionPoint = {
 	x: number;
 	y: number;
@@ -59,6 +60,9 @@ export async function removeBackground({
 	backgroundImage,
 	edgeExpand,
 	edgeFeather,
+	autoDetect = false,
+	autoMode = "main",
+	autoPrompt = "",
 }: {
 	file: File;
 	points: SelectionPoint[];
@@ -67,6 +71,9 @@ export async function removeBackground({
 	backgroundImage?: File;
 	edgeExpand: number;
 	edgeFeather: number;
+	autoDetect?: boolean;
+	autoMode?: AutoDetectMode;
+	autoPrompt?: string;
 }): Promise<File> {
 	const body = new FormData();
 	body.append("media", file, file.name);
@@ -75,6 +82,9 @@ export async function removeBackground({
 	body.append("background_color", backgroundColor);
 	body.append("edge_expand", edgeExpand.toString());
 	body.append("edge_feather", edgeFeather.toString());
+	body.append("auto_detect", autoDetect.toString());
+	body.append("auto_mode", autoMode);
+	body.append("auto_prompt", autoPrompt);
 	if (backgroundImage) {
 		body.append("background_image", backgroundImage, backgroundImage.name);
 	}
