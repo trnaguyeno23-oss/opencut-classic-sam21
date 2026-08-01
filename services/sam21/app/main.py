@@ -24,6 +24,19 @@ CHECKPOINT = MODEL_DIR / "sam2.1_hiera_tiny.pt"
 MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_t.yaml"
 MODEL_LOCK = threading.Lock()
 
+ANIMAL_CLASSES = {
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+}
+VIETNAMESE_CLASS_ALIASES = {
+    "người": "person", "nguoi": "person", "nhân vật": "person", "nhan vat": "person",
+    "chim": "bird", "mèo": "cat", "meo": "cat", "chó": "dog", "cho": "dog",
+    "hổ": "cat", "ho": "cat", "tiger": "cat",
+    "ngựa": "horse", "ngua": "horse", "cừu": "sheep", "cuu": "sheep",
+    "bò": "cow", "bo": "cow", "voi": "elephant", "gấu": "bear", "gau": "bear",
+    "ngựa vằn": "zebra", "ngua van": "zebra", "hươu cao cổ": "giraffe",
+    "huou cao co": "giraffe",
+}
+
 app = FastAPI(title="OpenCut SAM 2.1 Local", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +90,19 @@ def _video_predictor():
     )
     predictor.eval()
     return predictor
+
+
+@lru_cache(maxsize=1)
+def _object_detector():
+    from torchvision.models.detection import (
+        FasterRCNN_ResNet50_FPN_V2_Weights,
+        fasterrcnn_resnet50_fpn_v2,
+    )
+
+    weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+    model = fasterrcnn_resnet50_fpn_v2(weights=weights).to("cpu")
+    model.eval()
+    return model, weights
 
 
 def _safe_stem(name: str | None) -> str:
@@ -193,6 +219,91 @@ def _refine_mask(mask: np.ndarray, edge_expand: int, edge_feather: int) -> np.nd
     return refined.astype(np.float32) / 255.0
 
 
+def _requested_classes(auto_mode: str, prompt: str) -> set[str] | None:
+    if auto_mode == "person":
+        return {"person"}
+    if auto_mode == "animals":
+        return ANIMAL_CLASSES
+    if auto_mode == "person_animals":
+        return {"person", *ANIMAL_CLASSES}
+    if auto_mode == "text":
+        lowered = prompt.lower()
+        requested = {
+            english
+            for alias, english in VIETNAMESE_CLASS_ALIASES.items()
+            if alias in lowered
+        }
+        requested.update(name for name in {"person", *ANIMAL_CLASSES} if name in lowered)
+        return requested or None
+    return None
+
+
+def _detect_subject_boxes(
+    image: np.ndarray, auto_mode: str, prompt: str
+) -> list[np.ndarray]:
+    model, weights = _object_detector()
+    height, width = image.shape[:2]
+    tensor = weights.transforms()(Image.fromarray(image)).unsqueeze(0)
+    with MODEL_LOCK, torch.inference_mode():
+        prediction = model(tensor)[0]
+    categories = weights.meta["categories"]
+    requested = _requested_classes(auto_mode, prompt)
+    candidates: list[tuple[float, float, np.ndarray]] = []
+    for box, label, score in zip(
+        prediction["boxes"], prediction["labels"], prediction["scores"]
+    ):
+        confidence = float(score.detach().cpu())
+        if confidence < 0.55:
+            continue
+        class_name = str(categories[int(label.detach().cpu())]).lower()
+        if requested is not None and class_name not in requested:
+            continue
+        pixel_box = box.detach().cpu().numpy().astype(np.float32)
+        area_ratio = max(0.0, float(pixel_box[2] - pixel_box[0])) * max(
+            0.0, float(pixel_box[3] - pixel_box[1])
+        ) / float(width * height)
+        if area_ratio < 0.008 or area_ratio > 0.82:
+            continue
+        candidates.append((confidence, area_ratio, pixel_box))
+
+    # Prefer confident, visually substantial subjects and cap CPU work.
+    candidates.sort(key=lambda item: item[0] * (0.5 + min(item[1], 0.35)), reverse=True)
+    return [item[2] for item in candidates[:6]]
+
+
+def _mask_from_boxes(image: np.ndarray, boxes: list[np.ndarray]) -> np.ndarray:
+    height, width = image.shape[:2]
+    if not boxes:
+        return np.zeros((height, width), dtype=bool)
+    predictor = _image_predictor()
+    combined = np.zeros((height, width), dtype=bool)
+    with MODEL_LOCK, torch.inference_mode():
+        predictor.set_image(image)
+        for box in boxes:
+            masks, scores, _ = predictor.predict(box=box, multimask_output=True)
+            combined |= masks[int(np.argmax(scores))]
+    return combined
+
+
+def _scene_boundaries(frame_paths: list[Path]) -> list[tuple[int, int]]:
+    if not frame_paths:
+        return []
+    starts = [0]
+    previous = cv2.resize(
+        cv2.cvtColor(cv2.imread(str(frame_paths[0])), cv2.COLOR_BGR2GRAY), (96, 54)
+    )
+    for index, frame_path in enumerate(frame_paths[1:], start=1):
+        current = cv2.resize(
+            cv2.cvtColor(cv2.imread(str(frame_path)), cv2.COLOR_BGR2GRAY), (96, 54)
+        )
+        difference = float(np.mean(cv2.absdiff(previous, current)))
+        if difference >= 27.0 and index - starts[-1] >= 6:
+            starts.append(index)
+        previous = current
+    starts.append(len(frame_paths))
+    return [(starts[index], starts[index + 1]) for index in range(len(starts) - 1)]
+
+
 def _segment_image(
     input_path: Path,
     output_path: Path,
@@ -219,6 +330,28 @@ def _segment_image(
     mask = _refine_mask(combined, edge_expand, edge_feather)
     result = _composite(image, mask, mode, color, background)
     result.save(output_path, "PNG", optimize=True)
+
+
+def _segment_image_auto(
+    input_path: Path,
+    output_path: Path,
+    auto_mode: str,
+    auto_prompt: str,
+    mode: str,
+    color: tuple[int, int, int],
+    background: Image.Image | None,
+    edge_expand: int,
+    edge_feather: int,
+) -> None:
+    image = np.asarray(Image.open(input_path).convert("RGB"))
+    boxes = _detect_subject_boxes(image, auto_mode, auto_prompt)
+    if not boxes:
+        raise HTTPException(
+            status_code=422,
+            detail="AI không tìm thấy chủ thể phù hợp. Hãy thử chế độ Chủ thể chính hoặc chọn điểm thủ công.",
+        )
+    mask = _refine_mask(_mask_from_boxes(image, boxes), edge_expand, edge_feather)
+    _composite(image, mask, mode, color, background).save(output_path, "PNG", optimize=True)
 
 
 def _extract_frames(input_path: Path, frames_dir: Path) -> float:
@@ -367,6 +500,79 @@ def _segment_video(
     _encode_frames(output_frames, input_path, output_path, fps, mode == "transparent")
 
 
+def _segment_video_auto(
+    input_path: Path,
+    output_path: Path,
+    auto_mode: str,
+    auto_prompt: str,
+    mode: str,
+    color: tuple[int, int, int],
+    background: Image.Image | None,
+    work_dir: Path,
+    edge_expand: int,
+    edge_feather: int,
+) -> None:
+    source_frames = work_dir / "source-frames"
+    output_frames = work_dir / "output-frames"
+    source_frames.mkdir()
+    output_frames.mkdir()
+    fps = _extract_frames(input_path, source_frames)
+    frame_paths = sorted(source_frames.glob("*.jpg"))
+    if not frame_paths:
+        raise HTTPException(status_code=400, detail="Video không có khung hình đọc được.")
+
+    masks_by_frame: dict[int, np.ndarray] = {}
+    found_subject = False
+    predictor = _video_predictor()
+    for scene_number, (start, end) in enumerate(_scene_boundaries(frame_paths), start=1):
+        first = np.asarray(Image.open(frame_paths[start]).convert("RGB"))
+        height, width = first.shape[:2]
+        boxes = _detect_subject_boxes(first, auto_mode, auto_prompt)
+        if not boxes:
+            for frame_index in range(start, end):
+                masks_by_frame[frame_index] = np.zeros((height, width), dtype=bool)
+            continue
+        found_subject = True
+        scene_dir = work_dir / f"auto-scene-{scene_number:04d}"
+        scene_dir.mkdir()
+        for local_index, frame_path in enumerate(frame_paths[start:end], start=1):
+            shutil.copyfile(frame_path, scene_dir / f"{local_index:06d}.jpg")
+
+        with MODEL_LOCK, torch.inference_mode():
+            state = predictor.init_state(video_path=str(scene_dir))
+            for object_id, box in enumerate(boxes, start=1):
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=0,
+                    obj_id=object_id,
+                    box=box,
+                )
+            for local_frame, object_ids, mask_logits in predictor.propagate_in_video(state):
+                combined = np.zeros((height, width), dtype=bool)
+                for object_index, _object_id in enumerate(object_ids):
+                    combined |= mask_logits[object_index].detach().cpu().numpy().squeeze() > 0
+                # A near-full-frame mask is tracker drift, not a valid foreground subject.
+                if float(np.mean(combined)) > 0.78:
+                    combined[:] = False
+                masks_by_frame[start + int(local_frame)] = combined
+            predictor.reset_state(state)
+
+    if not found_subject:
+        raise HTTPException(
+            status_code=422,
+            detail="AI không tìm thấy chủ thể trong video. Hãy thử Chủ thể chính hoặc chọn điểm thủ công.",
+        )
+
+    for index, frame_path in enumerate(frame_paths):
+        rgb = np.asarray(Image.open(frame_path).convert("RGB"))
+        mask = masks_by_frame.get(index, np.zeros(rgb.shape[:2], dtype=bool))
+        refined = _refine_mask(mask, edge_expand, edge_feather)
+        result = _composite(rgb, refined, mode, color, background)
+        result.save(output_frames / f"{index + 1:06d}.png", "PNG")
+
+    _encode_frames(output_frames, input_path, output_path, fps, mode == "transparent")
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return {
@@ -448,6 +654,9 @@ def remove_background(
     background_image: UploadFile | None = File(None),
     edge_expand: int = Form(0, ge=-12, le=12),
     edge_feather: int = Form(2, ge=0, le=20),
+    auto_detect: bool = Form(False),
+    auto_mode: str = Form("main"),
+    auto_prompt: str = Form(""),
 ):
     _require_runtime()
     if background_mode not in {"transparent", "color", "image"}:
@@ -455,8 +664,10 @@ def remove_background(
     if background_mode == "image" and background_image is None:
         raise HTTPException(status_code=400, detail="Chưa chọn ảnh nền mới.")
 
+    if auto_mode not in {"main", "person", "animals", "person_animals", "text"}:
+        raise HTTPException(status_code=400, detail="Chế độ nhận diện tự động không hợp lệ.")
     color = _hex_to_rgb(background_color)
-    points = _parse_points(points_json, point_x, point_y)
+    points = [] if auto_detect else _parse_points(points_json, point_x, point_y)
     work_dir = Path(tempfile.mkdtemp(prefix="opencut-sam21-"))
     input_suffix = Path(media.filename or "media.bin").suffix or ".bin"
     input_path = work_dir / f"input{input_suffix}"
@@ -476,29 +687,28 @@ def remove_background(
 
     try:
         if is_image:
-            _segment_image(
-                input_path,
-                output_path,
-                points,
-                background_mode,
-                color,
-                background,
-                edge_expand,
-                edge_feather,
-            )
+            if auto_detect:
+                _segment_image_auto(
+                    input_path, output_path, auto_mode, auto_prompt, background_mode,
+                    color, background, edge_expand, edge_feather,
+                )
+            else:
+                _segment_image(
+                    input_path, output_path, points, background_mode, color, background,
+                    edge_expand, edge_feather,
+                )
             media_type = "image/png"
         else:
-            _segment_video(
-                input_path,
-                output_path,
-                points,
-                background_mode,
-                color,
-                background,
-                work_dir,
-                edge_expand,
-                edge_feather,
-            )
+            if auto_detect:
+                _segment_video_auto(
+                    input_path, output_path, auto_mode, auto_prompt, background_mode,
+                    color, background, work_dir, edge_expand, edge_feather,
+                )
+            else:
+                _segment_video(
+                    input_path, output_path, points, background_mode, color, background,
+                    work_dir, edge_expand, edge_feather,
+                )
             media_type = "video/webm" if output_suffix == ".webm" else "video/mp4"
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
