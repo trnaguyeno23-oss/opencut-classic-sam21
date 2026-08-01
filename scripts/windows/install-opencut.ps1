@@ -30,9 +30,38 @@ function Install-WithWinget {
     Write-Host "Dang cai $Name..." -ForegroundColor Cyan
     & winget.exe install --exact --id $Id --accept-package-agreements --accept-source-agreements --silent
     if ($LASTEXITCODE -ne 0) {
-        throw "Khong cai duoc $Name (winget exit code $LASTEXITCODE)."
+        Write-Host "WinGet tra ve ma $LASTEXITCODE. Dang kiem tra xem $Name da co san..." -ForegroundColor Yellow
     }
     Refresh-ProcessPath
+}
+
+function Find-Python311 {
+    $Candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+        (Join-Path $env:ProgramFiles "Python311\python.exe")
+    )
+    foreach ($Candidate in $Candidates) {
+        if (Test-Path $Candidate) {
+            return $Candidate
+        }
+    }
+
+    $Launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($Launcher) {
+        $LaunchedPath = & $Launcher.Source -3.11 -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $LaunchedPath -and (Test-Path $LaunchedPath.Trim())) {
+            return $LaunchedPath.Trim()
+        }
+    }
+
+    $CurrentPython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($CurrentPython) {
+        $Version = & $CurrentPython.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $Version.Trim() -eq "3.11") {
+            return $CurrentPython.Source
+        }
+    }
+    return $null
 }
 
 function Add-ToUserPath {
@@ -52,15 +81,15 @@ Write-Host "=== CAI DAT OPENCUT + SAM 2.1 CPU ===" -ForegroundColor Green
 Write-Host "Thu muc: $ProjectRoot"
 Refresh-ProcessPath
 
-$Python311Ready = $false
-$ExistingPython = Get-Command python.exe -ErrorAction SilentlyContinue
-if ($ExistingPython) {
-    & $ExistingPython.Source -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)"
-    $Python311Ready = ($LASTEXITCODE -eq 0)
-}
-if (-not $Python311Ready) {
+$PythonPath = Find-Python311
+if (-not $PythonPath) {
     Install-WithWinget -Id "Python.Python.3.11" -Name "Python 3.11"
+    $PythonPath = Find-Python311
 }
+if (-not $PythonPath) {
+    throw "Khong tim thay Python 3.11 sau khi cai. Hay khoi dong lai may va chay lai bo cai."
+}
+Write-Host "Da tim thay Python 3.11: $PythonPath" -ForegroundColor Green
 
 if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
     Install-WithWinget -Id "Gyan.FFmpeg" -Name "FFmpeg"
@@ -92,19 +121,12 @@ if ($BunFromWinget) {
     Add-ToUserPath $BunFromWinget.DirectoryName
 }
 
-foreach ($Command in @("python.exe", "ffmpeg.exe", "bun.exe")) {
+foreach ($Command in @("ffmpeg.exe", "bun.exe")) {
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
         throw "Da cai nhung Windows chua nhan dien $Command. Hay khoi dong lai may va chay lai file CAI-DAT-OPENCUT.bat."
     }
 }
 
-$Python311 = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"
-$PythonPath = if (Test-Path $Python311) {
-    $Python311
-}
-else {
-    (Get-Command python.exe).Source
-}
 $env:SAM21_PYTHON = $PythonPath
 
 if (-not (Test-Path $EnvLocal)) {
